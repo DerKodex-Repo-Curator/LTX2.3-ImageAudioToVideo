@@ -8,7 +8,7 @@ models:
   distilled_lora: ./models/ltx-2.3-22b-distilled-lora-384.safetensors
   distilled_lora_strength: 0.8
   spatial_upscaler: ./models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
-  gemma_root: ./models/gemma_root
+  gemma_root: ~/.cache/huggingface/ltx2_gemma3
 
 generation:
   height: null                # null = auto from image (snapped to 32-multiples)
@@ -35,4 +35,4 @@ performance:
   enhance_prompt: false
   streaming_prefetch_count: null
   max_batch_size: 1
-  max_pixels: 409600          # Resolution cap (640x640 equiv) — safe for 128GB; set 0 to disable
+  max_pixels: 0               # No resolution cap — memory-efficient pipeline handles full res

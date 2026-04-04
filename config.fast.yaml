@@ -8,7 +8,7 @@ models:
   distilled_lora: ./models/ltx-2.3-22b-distilled-lora-384.safetensors
   distilled_lora_strength: 0.8
   spatial_upscaler: ./models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
-  gemma_root: ./models/gemma_root
+  gemma_root: ~/.cache/huggingface/ltx2_gemma3
 
 generation:
   height: null
