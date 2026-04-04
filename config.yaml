@@ -1,0 +1,38 @@
+# LTX-2.3 Image+Audio to Video Configuration
+#
+# Model paths: Update these to point to your local model files.
+# Download from https://huggingface.co/Lightricks/LTX-2.3
+
+models:
+  checkpoint: ./models/ltx-2.3-22b-dev.safetensors
+  distilled_lora: ./models/ltx-2.3-22b-distilled-lora-384.safetensors
+  distilled_lora_strength: 0.8
+  spatial_upscaler: ./models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+  gemma_root: ./models/gemma_root
+
+generation:
+  height: null                # null = auto from image (snapped to 32-multiples)
+  width: null                 # null = auto from image (snapped to 32-multiples)
+  num_frames: null            # null = auto from audio duration (8k+1 format)
+  frame_rate: 25.0
+  num_inference_steps: 20     # Stage 1 steps (stage 2 always uses 4 distilled steps)
+  seed: 42
+  negative_prompt: "blurry, low quality, distorted, deformed face, bad lip sync, static, frozen, dull expression, cartoonish, 3D CGI, uncanny valley, jittery movement, flickering, artifacts"
+
+guidance:
+  video_cfg_scale: 3.0        # Classifier-free guidance scale
+  video_stg_scale: 1.0        # STG ON — better temporal coherence (set 0.0 for ~2x speed)
+  video_rescale_scale: 0.7    # CFG rescale factor
+  video_stg_blocks: [28]      # LTX-2.3 recommended STG block (set [] to disable)
+  video_skip_step: 0
+  a2v_guidance_scale: 3.0     # Audio-to-video modality guidance
+
+audio:
+  start_time: 0.0             # Audio offset in seconds
+  max_duration: null           # null = match video length
+
+performance:
+  enhance_prompt: false
+  streaming_prefetch_count: null
+  max_batch_size: 1
+  max_pixels: 409600          # Resolution cap (640x640 equiv) — safe for 128GB; set 0 to disable

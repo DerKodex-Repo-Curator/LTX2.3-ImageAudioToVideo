@@ -1,0 +1,38 @@
+# LTX-2.3 Image+Audio to Video — Fast Mode
+#
+# Optimized for speed (~5 min). Lower quality than default config.
+# Use with: python generate.py --config config.fast.yaml ...
+
+models:
+  checkpoint: ./models/ltx-2.3-22b-dev.safetensors
+  distilled_lora: ./models/ltx-2.3-22b-distilled-lora-384.safetensors
+  distilled_lora_strength: 0.8
+  spatial_upscaler: ./models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+  gemma_root: ./models/gemma_root
+
+generation:
+  height: null
+  width: null
+  num_frames: null
+  frame_rate: 25.0
+  num_inference_steps: 10     # Fewer steps = faster
+  seed: 42
+  negative_prompt: "blurry, low quality, distorted, deformed face, bad lip sync, static, frozen, dull expression"
+
+guidance:
+  video_cfg_scale: 3.5
+  video_stg_scale: 0.0        # STG OFF = ~2x faster per step
+  video_rescale_scale: 0.7
+  video_stg_blocks: []
+  video_skip_step: 0
+  a2v_guidance_scale: 3.0
+
+audio:
+  start_time: 0.0
+  max_duration: null
+
+performance:
+  enhance_prompt: false
+  streaming_prefetch_count: null
+  max_batch_size: 1
+  max_pixels: 409600

@@ -1,0 +1,32 @@
+# Dependencies
+.venv/
+LTX-2/
+
+# Models (downloaded separately)
+models/
+
+# Generated outputs
+outputs/*
+!outputs/.gitkeep
+
+# Inputs (user-provided)
+inputs/*
+!inputs/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Stereo conversion temp files
+*.stereo.wav
