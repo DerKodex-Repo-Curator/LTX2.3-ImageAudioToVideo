@@ -2,7 +2,8 @@
 """
 LTX-2.3 Image + Audio to Video with Lip Sync
 
-Two-stage pipeline with all models preloaded in unified memory.
+Two-stage pipeline (default): half-res denoise → learned 2x upsample → full-res refine.
+Single-stage fallback: denoises at target resolution directly.
 Matches source image resolution and audio duration automatically.
 """
 
@@ -89,6 +90,48 @@ def frames_for_duration(duration: float, fps: float) -> int:
     return 8 * k + 1
 
 
+def _log_system_memory():
+    """Log system memory at startup to help diagnose OOM issues."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024 ** 3)
+        avail_gb = mem.available / (1024 ** 3)
+        used_gb = mem.used / (1024 ** 3)
+        logger.info(f"System memory: {total_gb:.0f}GB total, {used_gb:.0f}GB used, {avail_gb:.0f}GB available")
+        if avail_gb < 70:
+            logger.warning(
+                f"Low memory: only {avail_gb:.0f}GB available. "
+                f"LTX-2.3 needs ~50-70GB free. Consider closing other apps or using config.fast.yaml."
+            )
+    except ImportError:
+        logger.info("Install psutil for memory diagnostics: pip install psutil")
+
+
+def _build_two_stage(models: dict, device: torch.device):
+    """Build the two-stage pipeline (faster + better quality)."""
+    from a2vid_preloaded import A2VidPreloaded
+    return A2VidPreloaded(
+        checkpoint_path=resolve_path(models["checkpoint"]),
+        distilled_lora_path=resolve_path(models["distilled_lora"]),
+        distilled_lora_strength=models.get("distilled_lora_strength", 0.8),
+        spatial_upsampler_path=resolve_path(models["spatial_upscaler"]),
+        gemma_root=resolve_path(models["gemma_root"]),
+        device=device,
+    )
+
+
+def _build_single_stage(models: dict, device: torch.device):
+    """Build the single-stage pipeline (MPS fallback)."""
+    from a2vid_one_stage import A2VidOneStage
+    return A2VidOneStage(
+        checkpoint_path=resolve_path(models["checkpoint"]),
+        gemma_root=resolve_path(models["gemma_root"]),
+        loras=[],
+        device=device,
+    )
+
+
 @torch.inference_mode()
 def generate(
     image_path: str,
@@ -96,6 +139,7 @@ def generate(
     prompt: str,
     output_path: str,
     cfg: dict,
+    pipeline_mode: str = "auto",
     seed: int | None = None,
     num_frames: int | None = None,
     height: int | None = None,
@@ -103,7 +147,9 @@ def generate(
     num_inference_steps: int | None = None,
     frame_rate: float | None = None,
     negative_prompt: str | None = None,
+    image_strength: float | None = None,
 ) -> str:
+    _log_system_memory()
     audio_path = ensure_stereo(audio_path)
 
     from ltx_core.components.guiders import MultiModalGuiderParams
@@ -112,12 +158,12 @@ def generate(
     from ltx_pipelines.utils.media_io import encode_video
 
     sys.path.insert(0, str(PROJECT_DIR))
-    from a2vid_preloaded import A2VidPreloaded
 
     models = cfg["models"]
     gen = cfg["generation"]
     guide = cfg["guidance"]
     audio_cfg = cfg["audio"]
+    perf = cfg.get("performance", {})
 
     _fps = frame_rate or gen["frame_rate"]
     _seed = seed if seed is not None and seed >= 0 else gen.get("seed", 42)
@@ -125,7 +171,7 @@ def generate(
     _neg = negative_prompt or gen["negative_prompt"]
 
     # Match source image resolution (with optional pixel budget cap)
-    max_px = cfg.get("performance", {}).get("max_pixels", 0)
+    max_px = perf.get("max_pixels", 0)
     if width is None or height is None:
         img_w, img_h = get_image_dims(image_path, max_pixels=max_px)
         _width = width or img_w
@@ -152,16 +198,15 @@ def generate(
     device = torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    # Load ALL models into memory at once
+    # Build pipeline
+    use_two_stage = pipeline_mode in ("auto", "two-stage")
     t0 = time.time()
-    pipeline = A2VidPreloaded(
-        checkpoint_path=resolve_path(models["checkpoint"]),
-        distilled_lora_path=resolve_path(models["distilled_lora"]),
-        distilled_lora_strength=models.get("distilled_lora_strength", 0.8),
-        spatial_upsampler_path=resolve_path(models["spatial_upscaler"]),
-        gemma_root=resolve_path(models["gemma_root"]),
-        device=device,
-    )
+    if use_two_stage:
+        logger.info("Pipeline: two-stage (half-res denoise → 2x upsample → full-res refine)")
+        pipeline = _build_two_stage(models, device)
+    else:
+        logger.info("Pipeline: single-stage (direct full-res denoise)")
+        pipeline = _build_single_stage(models, device)
     load_time = time.time() - t0
 
     video_guider_params = MultiModalGuiderParams(
@@ -173,7 +218,11 @@ def generate(
         stg_blocks=guide["video_stg_blocks"],
     )
 
-    images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
+    # Image conditioning strength: 1.0 freezes frame 0 (no lip movement).
+    # Lower values (0.2-0.5) allow the model to animate the face for lip sync.
+    _img_strength = image_strength if image_strength is not None else gen.get("image_conditioning_strength", 0.3)
+    logger.info(f"Image conditioning strength: {_img_strength}")
+    images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=_img_strength)]
 
     audio_start = audio_cfg.get("start_time", 0.0)
     audio_max_dur = audio_cfg.get("max_duration") or (_num_frames / _fps)
@@ -183,22 +232,43 @@ def generate(
     logger.info("Starting generation...")
     t1 = time.time()
 
-    video, audio = pipeline(
-        prompt=prompt,
-        negative_prompt=_neg,
-        seed=_seed,
-        height=_height,
-        width=_width,
-        num_frames=_num_frames,
-        frame_rate=_fps,
-        num_inference_steps=_steps,
-        video_guider_params=video_guider_params,
-        images=images,
-        audio_path=audio_path,
-        audio_start_time=audio_start,
-        audio_max_duration=audio_max_dur,
-        tiling_config=tiling_config,
-    )
+    if use_two_stage:
+        video, audio = pipeline(
+            prompt=prompt,
+            negative_prompt=_neg,
+            seed=_seed,
+            height=_height,
+            width=_width,
+            num_frames=_num_frames,
+            frame_rate=_fps,
+            num_inference_steps=_steps,
+            video_guider_params=video_guider_params,
+            images=images,
+            audio_path=audio_path,
+            audio_start_time=audio_start,
+            audio_max_duration=audio_max_dur,
+            tiling_config=tiling_config,
+        )
+    else:
+        video, audio = pipeline(
+            prompt=prompt,
+            negative_prompt=_neg,
+            seed=_seed,
+            height=_height,
+            width=_width,
+            num_frames=_num_frames,
+            frame_rate=_fps,
+            num_inference_steps=_steps,
+            video_guider_params=video_guider_params,
+            images=images,
+            audio_path=audio_path,
+            audio_start_time=audio_start,
+            audio_max_duration=audio_max_dur,
+            tiling_config=tiling_config,
+            enhance_prompt=perf.get("enhance_prompt", False),
+            streaming_prefetch_count=perf.get("streaming_prefetch_count"),
+            max_batch_size=perf.get("max_batch_size", 1),
+        )
 
     gen_time = time.time() - t1
 
@@ -226,6 +296,8 @@ def main():
     parser.add_argument("--prompt", "-p", required=True, help="Text prompt")
     parser.add_argument("--output", "-o", default=None, help="Output path")
     parser.add_argument("--config", "-c", default=None, help="Config file")
+    parser.add_argument("--pipeline", choices=["auto", "two-stage", "single-stage"],
+                        default="auto", help="Pipeline: auto (two-stage), two-stage, or single-stage")
     parser.add_argument("--seed", "-s", type=int, default=None)
     parser.add_argument("--num-frames", type=int, default=None, help="Override frame count (8k+1)")
     parser.add_argument("--height", type=int, default=None, help="Override height")
@@ -233,6 +305,8 @@ def main():
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--negative-prompt", type=str, default=None)
+    parser.add_argument("--image-strength", type=float, default=None,
+                        help="Image conditioning strength (0.0-1.0). Lower=more motion/lip sync, higher=more identity. Default 0.3")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -251,6 +325,7 @@ def main():
         prompt=args.prompt,
         output_path=output_path,
         cfg=cfg,
+        pipeline_mode=args.pipeline,
         seed=args.seed,
         num_frames=args.num_frames,
         height=args.height,
@@ -258,6 +333,7 @@ def main():
         num_inference_steps=args.steps,
         frame_rate=args.fps,
         negative_prompt=args.negative_prompt,
+        image_strength=args.image_strength,
     )
 
 

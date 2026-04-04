@@ -18,6 +18,9 @@ generation:
   num_inference_steps: 20     # Stage 1 steps (stage 2 always uses 4 distilled steps)
   seed: 42
   negative_prompt: "blurry, low quality, distorted, deformed face, bad lip sync, static, frozen, dull expression, cartoonish, 3D CGI, uncanny valley, jittery movement, flickering, artifacts"
+  # Image conditioning strength: 1.0 freezes frame 0 (no lip movement).
+  # 0.2-0.5 allows face animation for lip sync. Lower = more motion, higher = more identity.
+  image_conditioning_strength: 0.3
 
 guidance:
   video_cfg_scale: 3.0        # Classifier-free guidance scale
@@ -35,4 +38,7 @@ performance:
   enhance_prompt: false
   streaming_prefetch_count: null
   max_batch_size: 1
-  max_pixels: 614400          # 640x960 equiv — best quality that fits 128GB; your 768x1152 image scales to ~640x960
+  # max_pixels caps input resolution to prevent OOM. 614400 = ~640x960.
+  # Setting to 0 removes the cap — WILL OOM on 128GB with large images.
+  # Use 409600 (~640x640) for extra safety margin.
+  max_pixels: 614400

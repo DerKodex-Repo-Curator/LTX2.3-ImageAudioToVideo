@@ -1,95 +1,49 @@
 """
-Two-stage Audio-to-Video pipeline with staged transformer loading.
+Two-stage Audio-to-Video pipeline using upstream DiffusionStage blocks.
 
-Loads shared models (text encoder, VAE encoders/decoders, upsampler) once at
-init. Transformers are loaded one at a time — stage 1 transformer is built,
-used, and freed before stage 2 transformer (with distilled LoRA) is loaded.
-This keeps peak memory under 128GB on Apple Silicon.
+Based on upstream a2vid_two_stage.py. Stage 1 denoises at half resolution with
+audio frozen, Stage 2 upsamples and refines at full resolution with distilled LoRA.
+All models lazy-load in __call__ and free after use (managed by block classes).
 """
 
 import gc
 import logging
+import os
 import time
 from collections.abc import Iterator
-from typing import TypeVar
 
 import torch
 
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.schedulers import LTX2Scheduler
-from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, SDOps
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import DummyRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
-from ltx_core.model.audio_vae import (
-    AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
-    AudioEncoderConfigurator,
-    encode_audio as vae_encode_audio,
-)
-from ltx_core.model.transformer import LTXV_MODEL_COMFY_RENAMING_MAP, LTXModelConfigurator, X0Model
-from ltx_core.model.upsampler import LatentUpsamplerConfigurator, upsample_video
-from ltx_core.model.video_vae import (
-    VAE_DECODER_COMFY_KEYS_FILTER,
-    VAE_ENCODER_COMFY_KEYS_FILTER,
-    TilingConfig,
-    VideoDecoderConfigurator,
-    VideoEncoder,
-    VideoEncoderConfigurator,
-    get_video_chunks_number,
-)
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
+from ltx_core.model.video_vae import TilingConfig
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import (
-    EMBEDDINGS_PROCESSOR_KEY_OPS,
-    GEMMA_LLM_KEY_OPS,
-    GEMMA_MODEL_OPS,
-    EmbeddingsProcessorConfigurator,
-    GemmaTextEncoderConfigurator,
-    module_ops_from_gemma_root,
+from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
+from ltx_pipelines.utils.blocks import (
+    AudioConditioner,
+    DiffusionStage,
+    ImageConditioner,
+    PromptEncoder,
+    VideoDecoder,
+    VideoUpsampler,
 )
-from ltx_core.tools import AudioLatentTools, VideoLatentTools
-from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
-from ltx_core.utils import find_matching_file
 from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
-from ltx_pipelines.utils.helpers import (
-    cleanup_memory,
-    combined_image_conditionings,
-    create_noised_state,
-    get_device,
-)
-from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
-from ltx_pipelines.utils.samplers import euler_denoising_loop
+from ltx_pipelines.utils.helpers import combined_image_conditionings, get_device
+from ltx_pipelines.utils.media_io import decode_audio_from_file
 from ltx_pipelines.utils.types import ModalitySpec
 
-from dataclasses import replace
-
 logger = logging.getLogger(__name__)
-_M = TypeVar("_M", bound=torch.nn.Module)
-
-
-def _build_state(spec, tools, noiser, dtype, device):
-    state = create_noised_state(
-        tools=tools,
-        conditionings=spec.conditionings,
-        noiser=noiser,
-        dtype=dtype,
-        device=device,
-        noise_scale=spec.noise_scale,
-        initial_latent=spec.initial_latent,
-    )
-    if spec.frozen:
-        state = replace(state, denoise_mask=torch.zeros_like(state.denoise_mask))
-    return state
 
 
 class A2VidPreloaded:
     """
-    Two-stage audio-to-video with staged transformer loading.
-    Loads shared models at init. Transformers are loaded/freed one at a time
-    during __call__ to keep peak memory under 128GB.
+    Two-stage audio-to-video using upstream DiffusionStage blocks.
+    All models lazy-load in __call__ and are freed after use by the block classes.
+    Peak memory: one 22B transformer (~44GB) + block overhead at a time.
     """
 
     def __init__(
@@ -99,180 +53,64 @@ class A2VidPreloaded:
         distilled_lora_strength: float,
         spatial_upsampler_path: str,
         gemma_root: str,
-        loras: list[LoraPathStrengthAndSDOps] | None = None,
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
-        self._loras = loras or []
-        self._checkpoint_path = checkpoint_path
-        self._distilled_lora_path = distilled_lora_path
-        self._distilled_lora_strength = distilled_lora_strength
-        self._quantization = quantization
-        self._registry = DummyRegistry()
 
-        t0 = time.time()
-
-        # 1. Build Gemma text encoder
-        logger.info("Loading Gemma text encoder...")
-        module_ops = module_ops_from_gemma_root(gemma_root)
-        model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
-        weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
-
-        self.text_encoder = (
-            Builder(
-                model_path=tuple(weight_paths),
-                model_class_configurator=GemmaTextEncoderConfigurator,
-                model_sd_ops=GEMMA_LLM_KEY_OPS,
-                module_ops=(GEMMA_MODEL_OPS, *module_ops),
-                registry=self._registry,
-            )
-            .build(device=self.device, dtype=self.dtype)
-            .eval()
-        )
-        logger.info(f"  Text encoder loaded ({time.time()-t0:.0f}s)")
-
-        # 2. Build embeddings processor
-        t1 = time.time()
-        logger.info("Loading embeddings processor...")
-        self.embeddings_processor = (
-            Builder(
-                model_path=checkpoint_path,
-                model_class_configurator=EmbeddingsProcessorConfigurator,
-                model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
-                registry=self._registry,
-            )
-            .build(device=self.device, dtype=self.dtype)
-            .to(self.device)
-            .eval()
-        )
-        logger.info(f"  Embeddings processor loaded ({time.time()-t1:.0f}s)")
-
-        # 3. Build video encoder (for image conditioning)
-        t1 = time.time()
-        logger.info("Loading video encoder...")
-        self.video_encoder = (
-            Builder(
-                model_path=checkpoint_path,
-                model_class_configurator=VideoEncoderConfigurator,
-                model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
-                registry=self._registry,
-            )
-            .build(device=self.device, dtype=self.dtype)
-            .to(self.device)
-            .eval()
-        )
-        logger.info(f"  Video encoder loaded ({time.time()-t1:.0f}s)")
-
-        # 4. Build audio encoder
-        t1 = time.time()
-        logger.info("Loading audio encoder...")
-        self.audio_encoder = (
-            Builder(
-                model_path=checkpoint_path,
-                model_class_configurator=AudioEncoderConfigurator,
-                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
-                registry=self._registry,
-            )
-            .build(device=self.device, dtype=self.dtype)
-            .to(self.device)
-            .eval()
-        )
-        logger.info(f"  Audio encoder loaded ({time.time()-t1:.0f}s)")
-
-        # 5. Build spatial upsampler
-        t1 = time.time()
-        logger.info("Loading spatial upsampler...")
-        self.upsampler = (
-            Builder(
-                model_path=spatial_upsampler_path,
-                model_class_configurator=LatentUpsamplerConfigurator,
-                registry=self._registry,
-            )
-            .build(device=self.device, dtype=self.dtype)
-            .to(self.device)
-            .eval()
-        )
-        logger.info(f"  Upsampler loaded ({time.time()-t1:.0f}s)")
-
-        # 6. Build video decoder
-        t1 = time.time()
-        logger.info("Loading video decoder...")
-        self.video_decoder = (
-            Builder(
-                model_path=checkpoint_path,
-                model_class_configurator=VideoDecoderConfigurator,
-                model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
-                registry=self._registry,
-            )
-            .build(device=self.device, dtype=self.dtype)
-            .to(self.device)
-            .eval()
-        )
-        logger.info(f"  Video decoder loaded ({time.time()-t1:.0f}s)")
-
-        # Transformers are NOT loaded here — they are built on-demand in __call__
-        logger.info(f"Shared models loaded in {time.time()-t0:.0f}s (transformers loaded on-demand)")
-
-    def _build_transformer_s1(self):
-        """Build stage 1 transformer (no distilled LoRA)."""
-        logger.info("Loading transformer (stage 1)...")
-        t0 = time.time()
-        builder = Builder(
-            model_path=self._checkpoint_path,
-            model_class_configurator=LTXModelConfigurator,
-            model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
-            loras=tuple(self._loras),
-            registry=self._registry,
-        )
-        if self._quantization is not None:
-            builder = builder.with_module_ops(
-                (*builder.module_ops, *self._quantization.module_ops)
-            ).with_sd_ops(
-                SDOps(
-                    name=f"chain_{builder.model_sd_ops.name}+{self._quantization.sd_ops.name}",
-                    mapping=(*builder.model_sd_ops.mapping, *self._quantization.sd_ops.mapping),
-                )
-            )
-        transformer = X0Model(
-            builder.build(device=self.device)
-        ).to(self.device).eval()
-        logger.info(f"  Transformer stage 1 loaded ({time.time()-t0:.0f}s)")
-        return transformer
-
-    def _build_transformer_s2(self):
-        """Build stage 2 transformer (with distilled LoRA)."""
-        logger.info("Loading transformer (stage 2 + distilled LoRA)...")
-        t0 = time.time()
         distilled_lora_spec = LoraPathStrengthAndSDOps(
-            self._distilled_lora_path, self._distilled_lora_strength, LTXV_LORA_COMFY_RENAMING_MAP
+            distilled_lora_path, distilled_lora_strength, LTXV_LORA_COMFY_RENAMING_MAP
         )
-        loras = (*tuple(self._loras), distilled_lora_spec)
-        builder = Builder(
-            model_path=self._checkpoint_path,
-            model_class_configurator=LTXModelConfigurator,
-            model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
-            loras=loras,
-            registry=self._registry,
-            lora_load_device=self.device,
-        )
-        if self._quantization is not None:
-            builder = builder.with_module_ops(
-                (*builder.module_ops, *self._quantization.module_ops)
-            ).with_sd_ops(
-                SDOps(
-                    name=f"chain_{builder.model_sd_ops.name}+{self._quantization.sd_ops.name}",
-                    mapping=(*builder.model_sd_ops.mapping, *self._quantization.sd_ops.mapping),
-                )
-            )
-        transformer = X0Model(
-            builder.build(device=self.device)
-        ).to(self.device).eval()
-        logger.info(f"  Transformer stage 2 loaded ({time.time()-t0:.0f}s)")
-        return transformer
 
-    def _flush_memory(self):
+        # Block classes store config only — no weights loaded until __call__
+        self.prompt_encoder = PromptEncoder(
+            checkpoint_path, gemma_root, self.dtype, self.device,
+        )
+        self.image_conditioner = ImageConditioner(
+            checkpoint_path, self.dtype, self.device,
+        )
+        self.audio_conditioner = AudioConditioner(
+            checkpoint_path, self.dtype, self.device,
+        )
+        self.stage_1 = DiffusionStage(
+            checkpoint_path, self.dtype, self.device,
+            loras=(),
+            quantization=quantization,
+        )
+        self.stage_2 = DiffusionStage(
+            checkpoint_path, self.dtype, self.device,
+            loras=(distilled_lora_spec,),
+            quantization=quantization,
+        )
+        self.upsampler = VideoUpsampler(
+            checkpoint_path, spatial_upsampler_path, self.dtype, self.device,
+        )
+        self.video_decoder = VideoDecoder(
+            checkpoint_path, self.dtype, self.device,
+        )
+
+    def _log_memory(self, tag: str):
+        """Log current memory usage for diagnostics."""
+        parts = [f"[Memory] {tag}"]
+        try:
+            import psutil
+            rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+            parts.append(f"RSS={rss_gb:.1f}GB")
+        except ImportError:
+            pass
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            try:
+                alloc_gb = torch.mps.current_allocated_memory() / (1024 ** 3)
+                parts.append(f"MPS_alloc={alloc_gb:.1f}GB")
+            except Exception:
+                pass
+        elif torch.cuda.is_available():
+            alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+            parts.append(f"CUDA_alloc={alloc_gb:.1f}GB")
+        logger.info(" | ".join(parts))
+
+    def _flush_memory(self, tag: str = ""):
         """Force garbage collection and clear device caches."""
         gc.collect()
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -281,56 +119,8 @@ class A2VidPreloaded:
         elif torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-
-    def _release_model(self, model: torch.nn.Module):
-        """Move model to meta device to immediately release all storage."""
-        model.to("meta")
-
-    def _free_models(self, *names: str):
-        """Release model storage and delete attributes by name."""
-        for name in names:
-            model = getattr(self, name, None)
-            if model is not None and isinstance(model, torch.nn.Module):
-                model.to("meta")
-            if hasattr(self, name):
-                delattr(self, name)
-        self._flush_memory()
-
-    def _encode_prompts(self, prompts: list[str]):
-        raw_outputs = [self.text_encoder.encode(p) for p in prompts]
-        return [
-            self.embeddings_processor.process_hidden_states(hs, mask)
-            for hs, mask in raw_outputs
-        ]
-
-    def _run_diffusion(self, transformer, denoiser, sigmas, noiser, width, height,
-                       frames, fps, video_spec, audio_spec):
-        pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
-
-        v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
-        v_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
-        v_state = _build_state(video_spec, v_tools, noiser, self.dtype, self.device)
-
-        a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
-        a_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
-        a_state = _build_state(audio_spec, a_tools, noiser, self.dtype, self.device)
-
-        v_state, a_state = euler_denoising_loop(
-            sigmas=sigmas,
-            video_state=v_state,
-            audio_state=a_state,
-            stepper=EulerDiffusionStep(),
-            transformer=transformer,
-            denoiser=denoiser,
-        )
-
-        v_state = v_tools.clear_conditioning(v_state)
-        v_state = v_tools.unpatchify(v_state)
-        if a_state is not None:
-            a_state = a_tools.clear_conditioning(a_state)
-            a_state = a_tools.unpatchify(a_state)
-
-        return v_state, a_state
+        if tag:
+            self._log_memory(f"after flush: {tag}")
 
     def __call__(
         self,
@@ -356,123 +146,178 @@ class A2VidPreloaded:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
 
-        # --- Encode prompts, then free text encoder (~24GB) ---
-        logger.info("Encoding prompts...")
-        ctx_p, ctx_n = self._encode_prompts([prompt, negative_prompt])
-        v_ctx_p, a_ctx_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_ctx_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
-        self._free_models("text_encoder", "embeddings_processor")
-        logger.info("  Text encoder freed.")
+        self._log_memory("pipeline start")
 
-        # --- Encode audio, then free audio encoder ---
+        # --- 1. Encode prompts ---
+        logger.info("Encoding prompts...")
+        t0 = time.time()
+        ctx_p, ctx_n = self.prompt_encoder(
+            [prompt, negative_prompt],
+            enhance_first_prompt=False,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
+        self._flush_memory("prompts encoded")
+        logger.info(f"  Prompts encoded ({time.time()-t0:.0f}s)")
+
+        # --- 2. Encode audio ---
         logger.info("Encoding audio...")
+        t0 = time.time()
         decoded_audio = decode_audio_from_file(
             audio_path, self.device, audio_start_time, audio_max_duration
         )
         if decoded_audio is None:
             raise ValueError(f"Failed to decode audio from {audio_path}")
-        encoded_audio = vae_encode_audio(decoded_audio, self.audio_encoder, None)
+
+        encoded_audio_latent = self.audio_conditioner(
+            lambda enc: vae_encode_audio(decoded_audio, enc, None)
+        )
+        # Clip or pad audio latent to match target video duration
         audio_shape = AudioLatentShape.from_duration(
             batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
         )
-        # Clip or pad audio latent to match target video duration
         target_frames = audio_shape.frames
-        actual_frames = encoded_audio.shape[2]
+        actual_frames = encoded_audio_latent.shape[2]
         if actual_frames > target_frames:
-            encoded_audio = encoded_audio[:, :, :target_frames]
+            encoded_audio_latent = encoded_audio_latent[:, :, :target_frames]
         elif actual_frames < target_frames:
             pad_size = target_frames - actual_frames
-            encoded_audio = torch.nn.functional.pad(encoded_audio, (0, 0, 0, pad_size), mode="replicate")
+            encoded_audio_latent = torch.nn.functional.pad(
+                encoded_audio_latent, (0, 0, 0, pad_size), mode="replicate"
+            )
             logger.info(f"  Padded audio latent from {actual_frames} to {target_frames} frames")
-        self._free_models("audio_encoder")
-        logger.info("  Audio encoder freed.")
 
-        # --- Stage 1: denoise at half resolution ---
+        self._flush_memory("audio encoded")
+        logger.info(f"  Audio encoded ({time.time()-t0:.0f}s)")
+
+        # --- 3. Stage 1: denoise at half resolution, audio frozen ---
         s1_h, s1_w = height // 2, width // 2
         logger.info(f"Stage 1: denoising {num_inference_steps} steps at {s1_w}x{s1_h}...")
+        t0 = time.time()
 
-        s1_cond = combined_image_conditionings(
-            images=images, height=s1_h, width=s1_w,
-            video_encoder=self.video_encoder, dtype=self.dtype, device=self.device,
+        stage_1_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images, height=s1_h, width=s1_w,
+                video_encoder=enc, dtype=self.dtype, device=self.device,
+            )
         )
 
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
             dtype=torch.float32, device=self.device
         )
 
-        transformer_s1 = self._build_transformer_s1()
-
-        v_state, _ = self._run_diffusion(
-            transformer=transformer_s1,
+        video_state, _ = self.stage_1(
             denoiser=GuidedDenoiser(
-                v_context=v_ctx_p, a_context=a_ctx_p,
-                video_guider=MultiModalGuider(params=video_guider_params, negative_context=v_ctx_n),
-                audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
+                v_context=v_context_p,
+                a_context=a_context_p,
+                video_guider=MultiModalGuider(
+                    params=video_guider_params,
+                    negative_context=v_context_n,
+                ),
+                audio_guider=MultiModalGuider(
+                    params=MultiModalGuiderParams(),
+                ),
             ),
-            sigmas=sigmas, noiser=noiser,
-            width=s1_w, height=s1_h, frames=num_frames, fps=frame_rate,
-            video_spec=ModalitySpec(context=v_ctx_p, conditionings=s1_cond),
-            audio_spec=ModalitySpec(context=a_ctx_p, frozen=True, noise_scale=0.0,
-                                   initial_latent=encoded_audio),
+            sigmas=sigmas,
+            noiser=noiser,
+            width=s1_w,
+            height=s1_h,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_1_conditionings,
+            ),
+            audio=ModalitySpec(
+                context=a_context_p,
+                frozen=True,
+                noise_scale=0.0,
+                initial_latent=encoded_audio_latent,
+            ),
         )
 
-        transformer_s1.to("meta")
-        del transformer_s1, s1_cond, sigmas
-        self._flush_memory()
-        logger.info("Stage 1 complete — transformer freed.")
+        self._flush_memory("stage 1 complete")
+        logger.info(f"  Stage 1 complete ({time.time()-t0:.0f}s)")
 
-        # --- Upsample 2x, then free upsampler ---
+        # --- 4. Upsample 2x ---
+        # MPS can crash on einops rearrange + depthwise conv in upsampler.
+        # Fall back to CPU if that happens (~150MB model, <60s on CPU).
         logger.info("Upsampling latent 2x...")
-        upscaled = upsample_video(
-            latent=v_state.latent[:1],
-            video_encoder=self.video_encoder,
-            upsampler=self.upsampler,
-        )
-        del v_state
-        self._free_models("upsampler")
-        logger.info("  Upsampler freed.")
+        t0 = time.time()
+        try:
+            upscaled_video_latent = self.upsampler(video_state.latent[:1])
+        except RuntimeError as e:
+            if "mps" not in str(e).lower() and "not supported" not in str(e).lower():
+                raise
+            logger.warning(f"MPS upsampler failed ({e}), falling back to CPU...")
+            from ltx_core.model.upsampler import upsample_video
+            # Build encoder and upsampler on CPU manually
+            cpu = torch.device("cpu")
+            encoder = self.upsampler._encoder_builder.build(device=cpu, dtype=self.dtype).to(cpu).eval()
+            up_model = self.upsampler._upsampler_builder.build(device=cpu, dtype=self.dtype).to(cpu).eval()
+            upscaled_video_latent = upsample_video(
+                latent=video_state.latent[:1].to(cpu),
+                video_encoder=encoder,
+                upsampler=up_model,
+            ).to(self.device)
+            del encoder, up_model
 
-        # --- Build stage 2 conditionings, then free video encoder ---
-        s2_cond = combined_image_conditionings(
-            images=images, height=height, width=width,
-            video_encoder=self.video_encoder, dtype=self.dtype, device=self.device,
-        )
-        self._free_models("video_encoder")
-        logger.info("  Video encoder freed.")
+        del video_state
+        self._flush_memory("upsampled")
+        logger.info(f"  Upsampled ({time.time()-t0:.0f}s)")
 
-        # --- Stage 2: refine at full resolution ---
+        # --- 5. Stage 2: refine at full resolution, audio frozen ---
         logger.info(f"Stage 2: refining 4 steps at {width}x{height}...")
+        t0 = time.time()
+
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
-        transformer_s2 = self._build_transformer_s2()
-
-        v_state, _ = self._run_diffusion(
-            transformer=transformer_s2,
-            denoiser=SimpleDenoiser(v_ctx_p, a_ctx_p),
-            sigmas=distilled_sigmas, noiser=noiser,
-            width=width, height=height, frames=num_frames, fps=frame_rate,
-            video_spec=ModalitySpec(context=v_ctx_p, conditionings=s2_cond,
-                                   noise_scale=distilled_sigmas[0].item(),
-                                   initial_latent=upscaled),
-            audio_spec=ModalitySpec(context=a_ctx_p, frozen=True, noise_scale=0.0,
-                                   initial_latent=encoded_audio),
+        stage_2_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images, height=height, width=width,
+                video_encoder=enc, dtype=self.dtype, device=self.device,
+            )
         )
 
-        transformer_s2.to("meta")
-        del transformer_s2, s2_cond, upscaled, distilled_sigmas
-        del v_ctx_p, v_ctx_n, a_ctx_p, encoded_audio
-        self._flush_memory()
-        logger.info("Stage 2 complete — transformer freed.")
+        video_state, _ = self.stage_2(
+            denoiser=SimpleDenoiser(v_context_p, a_context_p),
+            sigmas=distilled_sigmas,
+            noiser=noiser,
+            width=width,
+            height=height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_2_conditionings,
+                noise_scale=distilled_sigmas[0].item(),
+                initial_latent=upscaled_video_latent,
+            ),
+            audio=ModalitySpec(
+                context=a_context_p,
+                frozen=True,
+                noise_scale=0.0,
+                initial_latent=encoded_audio_latent,
+            ),
+        )
 
-        # --- Decode video ---
+        del upscaled_video_latent, distilled_sigmas
+        self._flush_memory("stage 2 complete")
+        logger.info(f"  Stage 2 complete ({time.time()-t0:.0f}s)")
+
+        # --- 6. Decode video ---
         logger.info("Decoding video...")
-        decoded_video = self.video_decoder.decode_video(
-            v_state.latent, tiling_config, generator
-        )
+        t0 = time.time()
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
 
+        # Return original audio waveform for fidelity (not VAE-decoded)
         original_audio = Audio(
             waveform=decoded_audio.waveform.squeeze(0),
             sampling_rate=decoded_audio.sampling_rate,
         )
+
+        self._log_memory("pipeline complete")
+        logger.info(f"  Video decoded ({time.time()-t0:.0f}s)")
 
         return decoded_video, original_audio
