@@ -217,10 +217,14 @@ def generate(
         skip_step=guide["video_skip_step"],
         stg_blocks=guide["video_stg_blocks"],
     )
+    audio_guider_params = MultiModalGuiderParams(
+        cfg_scale=guide.get("audio_cfg_scale", 7.0),
+        modality_scale=guide.get("audio_modality_scale", 3.0),
+    )
 
     # Image conditioning strength: 1.0 freezes frame 0 (no lip movement).
-    # Lower values (0.2-0.5) allow the model to animate the face for lip sync.
-    _img_strength = image_strength if image_strength is not None else gen.get("image_conditioning_strength", 0.3)
+    # 0.7-0.8 preserves identity while allowing lip sync (per ComfyUI workflows).
+    _img_strength = image_strength if image_strength is not None else gen.get("image_conditioning_strength", 0.7)
     logger.info(f"Image conditioning strength: {_img_strength}")
     images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=_img_strength)]
 
@@ -243,6 +247,7 @@ def generate(
             frame_rate=_fps,
             num_inference_steps=_steps,
             video_guider_params=video_guider_params,
+            audio_guider_params=audio_guider_params,
             images=images,
             audio_path=audio_path,
             audio_start_time=audio_start,
@@ -260,6 +265,7 @@ def generate(
             frame_rate=_fps,
             num_inference_steps=_steps,
             video_guider_params=video_guider_params,
+            audio_guider_params=audio_guider_params,
             images=images,
             audio_path=audio_path,
             audio_start_time=audio_start,

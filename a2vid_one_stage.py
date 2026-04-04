@@ -111,6 +111,7 @@ class A2VidOneStage:
         frame_rate: float,
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
+        audio_guider_params: MultiModalGuiderParams,
         images: list,
         audio_path: str,
         audio_start_time: float = 0.0,
@@ -146,7 +147,7 @@ class A2VidOneStage:
             streaming_prefetch_count=streaming_prefetch_count,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         del prompt_encoder
         self._flush_memory("prompt encoder freed")
@@ -242,7 +243,8 @@ class A2VidOneStage:
                     negative_context=v_context_n,
                 ),
                 audio_guider=MultiModalGuider(
-                    params=MultiModalGuiderParams(),
+                    params=audio_guider_params,
+                    negative_context=a_context_n,
                 ),
             ),
             sigmas=sigmas,

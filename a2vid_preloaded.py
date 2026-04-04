@@ -133,6 +133,7 @@ class A2VidPreloaded:
         frame_rate: float,
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
+        audio_guider_params: MultiModalGuiderParams,
         images: list,
         audio_path: str,
         audio_start_time: float = 0.0,
@@ -157,7 +158,7 @@ class A2VidPreloaded:
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
         self._flush_memory("prompts encoded")
         logger.info(f"  Prompts encoded ({time.time()-t0:.0f}s)")
 
@@ -216,7 +217,8 @@ class A2VidPreloaded:
                     negative_context=v_context_n,
                 ),
                 audio_guider=MultiModalGuider(
-                    params=MultiModalGuiderParams(),
+                    params=audio_guider_params,
+                    negative_context=a_context_n,
                 ),
             ),
             sigmas=sigmas,

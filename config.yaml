@@ -18,17 +18,19 @@ generation:
   num_inference_steps: 20     # Stage 1 steps (stage 2 always uses 4 distilled steps)
   seed: 42
   negative_prompt: "blurry, low quality, distorted, deformed face, bad lip sync, static, frozen, dull expression, cartoonish, 3D CGI, uncanny valley, jittery movement, flickering, artifacts"
-  # Image conditioning strength: 1.0 freezes frame 0 (no lip movement).
-  # 0.2-0.5 allows face animation for lip sync. Lower = more motion, higher = more identity.
-  image_conditioning_strength: 0.3
+  # Image conditioning strength: 1.0 freezes frame 0, 0.0 = free generation.
+  # 0.7-0.8 preserves identity while allowing lip sync (per working ComfyUI workflows).
+  image_conditioning_strength: 0.7
 
 guidance:
   video_cfg_scale: 3.0        # Classifier-free guidance scale
-  video_stg_scale: 1.0        # STG ON — better temporal coherence (set 0.0 for ~2x speed)
-  video_rescale_scale: 0.7    # CFG rescale factor
-  video_stg_blocks: [28]      # LTX-2.3 recommended STG block (set [] to disable)
+  video_stg_scale: 0.0        # STG OFF — working ComfyUI workflows disable this
+  video_rescale_scale: 0.0    # CFG rescale OFF — matches working workflows
+  video_stg_blocks: [29]      # Block 29 (working workflows use 29, not 28)
   video_skip_step: 0
-  a2v_guidance_scale: 3.0     # Audio-to-video modality guidance
+  a2v_guidance_scale: 3.0     # Video modality guidance (audio-to-video coupling)
+  audio_cfg_scale: 7.0        # Audio classifier-free guidance — CRITICAL for lip sync
+  audio_modality_scale: 3.0   # Audio modality guidance — CRITICAL for lip sync
 
 audio:
   start_time: 0.0             # Audio offset in seconds
