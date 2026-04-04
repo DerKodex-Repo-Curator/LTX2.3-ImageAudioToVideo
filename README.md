@@ -151,7 +151,7 @@ Two configs included:
 
 - Python 3.11+
 - PyTorch with MPS (macOS) or CUDA support
-- 128GB+ unified memory (Apple Silicon) or equivalent GPU VRAM
+- 128GB unified memory (Apple Silicon) recommended. May run on 64GB with very high memory pressure and reduced resolution — expect heavy swap usage and significantly slower generation
 - ~50GB disk space for models
 
 ## License
