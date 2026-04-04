@@ -35,4 +35,4 @@ performance:
   enhance_prompt: false
   streaming_prefetch_count: null
   max_batch_size: 1
-  max_pixels: 0               # No resolution cap — memory-efficient pipeline handles full res
+  max_pixels: 614400          # 640x960 equiv — best quality that fits 128GB; your 768x1152 image scales to ~640x960
