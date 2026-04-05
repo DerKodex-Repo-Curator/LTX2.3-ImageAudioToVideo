@@ -17,9 +17,7 @@ Generate lip-synced talking-head videos from a still image and an audio file. Bu
 <td><img src="demo/pirate_input.png" width="300"></td>
 <td>
 
-https://github.com/user-attachments/assets/demo-pirate-output
-
-<em><a href="demo/pirate_output.mp4">▶ View full video</a></em>
+https://github.com/techfreakworm/LTX2.3-ImageAudioToVideo/raw/main/demo/pirate_output.mp4
 
 </td>
 </tr>
