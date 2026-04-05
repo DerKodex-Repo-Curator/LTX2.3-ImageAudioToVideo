@@ -90,6 +90,60 @@ def frames_for_duration(duration: float, fps: float) -> int:
     return 8 * k + 1
 
 
+# RoPE positional embedding training max = 20 latent frames.
+# VAE temporal downsampling = 8x → (19)*8+1 = 153 pixel frames.
+# We use 145 (8*18+1) as safe max to stay well within training range.
+MAX_SAFE_FRAMES = 145
+
+
+def _round_to_8k1(n: int) -> int:
+    """Round frame count to nearest valid 8k+1 format."""
+    k = max(1, round((n - 1) / 8))
+    return 8 * k + 1
+
+
+def _extract_last_frame(video_path: str) -> str:
+    """Extract last frame from video as PNG using ffmpeg."""
+    import subprocess
+    frame_path = video_path.replace(".mp4", "_lastframe.png")
+    cmd = [
+        "ffmpeg", "-y", "-sseof", "-0.1", "-i", video_path,
+        "-frames:v", "1", "-update", "1", frame_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to extract last frame: {result.stderr}")
+    return frame_path
+
+
+def _concatenate_videos(chunk_paths: list[str], output_path: str, audio_path: str) -> str:
+    """Concatenate chunk videos and mux original audio using ffmpeg."""
+    import subprocess
+    import tempfile
+
+    # Write concat list
+    list_path = output_path.replace(".mp4", "_concat.txt")
+    with open(list_path, "w") as f:
+        for p in chunk_paths:
+            f.write(f"file '{p}'\n")
+
+    # Concat video streams, replace audio with original
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+        "-i", audio_path,
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v", "-map", "1:a",
+        "-shortest",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    Path(list_path).unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to concatenate videos: {result.stderr}")
+    return output_path
+
+
 def _log_system_memory():
     """Log system memory at startup to help diagnose OOM issues."""
     try:
@@ -239,60 +293,84 @@ def generate(
 
     tiling_config = TilingConfig.default()
 
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _run_pipeline(n_frames, a_start, a_dur, img_list):
+        """Run pipeline once for a given frame range."""
+        kwargs = dict(
+            prompt=prompt, negative_prompt=_neg, seed=_seed,
+            height=_height, width=_width, num_frames=n_frames,
+            frame_rate=_fps, num_inference_steps=_steps,
+            video_guider_params=video_guider_params, images=img_list,
+            audio_path=audio_path, audio_start_time=a_start,
+            audio_max_duration=a_dur, tiling_config=tiling_config,
+        )
+        if not use_two_stage:
+            kwargs.update(
+                enhance_prompt=perf.get("enhance_prompt", False),
+                streaming_prefetch_count=perf.get("streaming_prefetch_count"),
+                max_batch_size=perf.get("max_batch_size", 1),
+            )
+        return pipeline(**kwargs)
+
+    def _save_video(vid, aud, n_frames, path):
+        """Encode video+audio to MP4."""
+        video_chunks = get_video_chunks_number(n_frames, tiling_config)
+        encode_video(video=vid, fps=_fps, audio=aud, output_path=path, video_chunks_number=video_chunks)
+
     logger.info("Starting generation...")
     t1 = time.time()
 
-    if use_two_stage:
-        video, audio = pipeline(
-            prompt=prompt,
-            negative_prompt=_neg,
-            seed=_seed,
-            height=_height,
-            width=_width,
-            num_frames=_num_frames,
-            frame_rate=_fps,
-            num_inference_steps=_steps,
-            video_guider_params=video_guider_params,
-            images=images,
-            audio_path=audio_path,
-            audio_start_time=audio_start,
-            audio_max_duration=audio_max_dur,
-            tiling_config=tiling_config,
-        )
+    if _num_frames <= MAX_SAFE_FRAMES:
+        # --- Single pass (short audio, within RoPE range) ---
+        video, audio = _run_pipeline(_num_frames, audio_start, audio_max_dur, images)
+        logger.info(f"Encoding video to {output_path}...")
+        _save_video(video, audio, _num_frames, output_path)
     else:
-        video, audio = pipeline(
-            prompt=prompt,
-            negative_prompt=_neg,
-            seed=_seed,
-            height=_height,
-            width=_width,
-            num_frames=_num_frames,
-            frame_rate=_fps,
-            num_inference_steps=_steps,
-            video_guider_params=video_guider_params,
-            images=images,
-            audio_path=audio_path,
-            audio_start_time=audio_start,
-            audio_max_duration=audio_max_dur,
-            tiling_config=tiling_config,
-            enhance_prompt=perf.get("enhance_prompt", False),
-            streaming_prefetch_count=perf.get("streaming_prefetch_count"),
-            max_batch_size=perf.get("max_batch_size", 1),
+        # --- Chunked generation (long audio, exceeds RoPE range) ---
+        chunk_duration = MAX_SAFE_FRAMES / _fps
+        total_duration = _num_frames / _fps
+        num_chunks = math.ceil(total_duration / chunk_duration)
+        logger.info(
+            f"Audio {total_duration:.1f}s -> {_num_frames} frames exceeds {MAX_SAFE_FRAMES} max. "
+            f"Chunking into {num_chunks} segments of ~{chunk_duration:.1f}s"
         )
+
+        chunk_paths = []
+        current_image_path = image_path
+        audio_offset = audio_start
+
+        for i in range(num_chunks):
+            remaining_duration = total_duration - (i * chunk_duration)
+            this_duration = min(chunk_duration, remaining_duration)
+            this_frames = _round_to_8k1(int(math.ceil(this_duration * _fps)))
+
+            logger.info(f"--- Chunk {i+1}/{num_chunks}: {this_frames} frames ({audio_offset:.1f}s - {audio_offset + this_duration:.1f}s) ---")
+
+            chunk_images = [ImageConditioningInput(path=current_image_path, frame_idx=0, strength=_img_strength)]
+            video, audio = _run_pipeline(this_frames, audio_offset, this_duration, chunk_images)
+
+            chunk_path = output_path.replace(".mp4", f"_chunk{i:02d}.mp4")
+            _save_video(video, audio, this_frames, chunk_path)
+            chunk_paths.append(chunk_path)
+
+            # Extract last frame for next chunk's image conditioning
+            if i < num_chunks - 1:
+                current_image_path = _extract_last_frame(chunk_path)
+                logger.info(f"  Extracted last frame: {current_image_path}")
+
+            audio_offset += this_duration
+
+        # Concatenate all chunks
+        logger.info(f"Concatenating {num_chunks} chunks -> {output_path}")
+        _concatenate_videos(chunk_paths, output_path, audio_path)
+
+        # Clean up chunk files
+        for p in chunk_paths:
+            Path(p).unlink(missing_ok=True)
+            Path(p.replace(".mp4", "_lastframe.png")).unlink(missing_ok=True)
 
     gen_time = time.time() - t1
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    video_chunks = get_video_chunks_number(_num_frames, tiling_config)
-
-    logger.info(f"Encoding video to {output_path}...")
-    encode_video(
-        video=video,
-        fps=_fps,
-        audio=audio,
-        output_path=output_path,
-        video_chunks_number=video_chunks,
-    )
 
     total_time = time.time() - t0
     logger.info(f"Done! {output_path}")
