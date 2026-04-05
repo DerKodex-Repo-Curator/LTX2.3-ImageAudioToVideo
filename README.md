@@ -8,24 +8,13 @@ Generate lip-synced talking-head videos from a still image and an audio file. Bu
 
 **Pirate Captain — Lip-synced speech with scene animation**
 
-<table>
-<tr>
-<td align="center"><strong>Input Image</strong></td>
-<td align="center"><strong>Output Video</strong></td>
-</tr>
-<tr>
-<td><img src="demo/pirate_input.png" width="300"></td>
-<td>
+| Input Image | Output (preview · [full video with audio](demo/pirate_output.mp4)) |
+|:-----------:|:------------------------------------------------------------------:|
+| <img src="demo/pirate_input.png" width="300"> | <img src="demo/pirate_preview.gif" width="300"> |
 
-https://github.com/techfreakworm/LTX2.3-ImageAudioToVideo/raw/main/demo/pirate_output.mp4
-
-</td>
-</tr>
-</table>
-
-> **Prompt:** *"A grizzled pirate captain speaks intensely on the deck of a burning ship at night, his mouth moving with each word as he holds a sword pointed at a kneeling prisoner. The pirate's beard bristles as he talks, his eyes fierce and unwavering, his coat swaying gently in the ocean wind. Firelight from the blaze behind him dances across his weathered face, casting dramatic flickering shadows..."*
+> **Prompt:** *"A weathered pirate captain speaking boldly, his lips moving with each word, beard shifting as his jaw opens and closes, fierce eyes narrowing, face lit by warm flickering firelight against a dark night sky on a ship deck"*
 >
-> 🎵 [Pirate voice audio](demo/pirate_voice.mp3) · Generated with `--seed 77 --upscale 2` (~5 min on M4 Max 128GB)
+> Generated with `--seed 77 --upscale 2` (~5 min per chunk on M4 Max 128GB)
 
 ## Features
 
