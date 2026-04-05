@@ -11,13 +11,13 @@ echo "=== LTX-2.3 Image+Audio to Video Setup ==="
 echo ""
 
 # ---------------------------------------------------------------
-# 1. Clone LTX-2 repo
+# 1. Initialize LTX-2 submodule (fork with MPS/Apple Silicon fixes)
 # ---------------------------------------------------------------
-if [ -d "$LTX2_DIR" ]; then
-    echo "[OK] LTX-2 repo already cloned"
+if [ -f "$LTX2_DIR/README.md" ]; then
+    echo "[OK] LTX-2 submodule already initialized"
 else
-    echo "[*] Cloning Lightricks/LTX-2..."
-    git clone https://github.com/Lightricks/LTX-2.git "$LTX2_DIR"
+    echo "[*] Initializing LTX-2 submodule..."
+    git submodule update --init --recursive
 fi
 
 # ---------------------------------------------------------------

@@ -1,6 +1,5 @@
 # Dependencies
 .venv/
-LTX-2/
 
 # Models (downloaded separately)
 models/

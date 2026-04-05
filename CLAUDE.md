@@ -41,18 +41,20 @@ The audio VAE requires **stereo input**. Mono files are auto-converted by `ensur
 generate.py            # CLI entry point — parses args, loads config, runs pipeline
 a2vid_preloaded.py     # Two-stage pipeline (staged transformer loading, memory-efficient)
 a2vid_one_stage.py     # Single-stage pipeline (MPS-compatible fallback)
-config.yaml            # Quality config (30 steps, upstream defaults, ~35 min)
-config.fast.yaml       # Fast config (10 steps, STG off, ~5 min)
-setup.sh               # Automated setup: clone LTX-2, create venv, install deps
-.gitignore             # Ignores .venv/, LTX-2/, models/, outputs/
+config.yaml            # Quality config (10 steps, STG off, ~5 min)
+config.fast.yaml       # Fast config (same values, for backward compat)
+setup.sh               # Automated setup: init submodule, create venv, install deps
+.gitignore             # Ignores .venv/, models/, outputs/
 inputs/                # Input files (user-provided images and audio)
 outputs/               # Generated MP4 videos (timestamped filenames)
+demo/                  # Demo assets (pirate scene input/output for README)
 models/                # Downloaded model files (not committed)
   gemma_root/          # Gemma text encoder + tokenizer files
-LTX-2/                 # Cloned Lightricks/LTX-2 repo (not committed)
+LTX-2/                 # Git submodule: techfreakworm/LTX-2 (fork with MPS fixes)
   packages/ltx-core/   # Core model components (installed as editable package)
   packages/ltx-pipelines/ # Pipeline utilities (installed as editable package)
 .venv/                 # Python 3.11 virtual environment (not committed)
+FUTURE_IMPROVEMENTS.md # Known MPS limitations and plans to fix
 ```
 
 ## Setup
@@ -139,6 +141,8 @@ Both pipelines use `GuidedDenoiser` with constant guidance params throughout all
 ## Development Notes
 
 - `generate.py` is the only CLI entry point. Both pipeline classes are importable modules.
-- Upstream `ltx-core` and `ltx-pipelines` are editable installs from `LTX-2/packages/` — changes there take effect immediately.
+- `LTX-2/` is a **git submodule** pointing to `techfreakworm/LTX-2` (fork with MPS fixes, branch `fix/mps-apple-silicon-compatibility`). Upstream PR: Lightricks/LTX-2#184.
+- `ltx-core` and `ltx-pipelines` are editable installs from `LTX-2/packages/` — changes there take effect immediately.
+- The audio guider uses `MultiModalGuiderParams()` (all defaults) — audio is frozen during diffusion and must NOT be guided. This matches the upstream `a2vid_two_stage.py` exactly.
 - No tests or CI exist. Validate changes by running generation end-to-end.
 - Python 3.11 is used in the venv.

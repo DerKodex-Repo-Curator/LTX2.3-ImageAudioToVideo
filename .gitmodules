@@ -1,0 +1,4 @@
+[submodule "LTX-2"]
+	path = LTX-2
+	url = https://github.com/techfreakworm/LTX-2.git
+	branch = fix/mps-apple-silicon-compatibility
