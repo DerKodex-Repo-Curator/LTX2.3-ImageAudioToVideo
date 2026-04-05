@@ -152,7 +152,6 @@ def generate(
     _log_system_memory()
     audio_path = ensure_stereo(audio_path)
 
-    from ltx_core.components.guiders import MultiModalGuiderParams
     from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
     from ltx_pipelines.utils.args import ImageConditioningInput
     from ltx_pipelines.utils.media_io import encode_video
@@ -192,6 +191,11 @@ def generate(
     logger.info(f"Output: {_width}x{_height}, {_num_frames} frames @ {_fps}fps = {duration:.1f}s")
     logger.info(f"Image: {image_path}")
     logger.info(f"Audio: {audio_path}")
+    
+    # Auto-inject camera stabilizers if the user didn't specify cinematic motions
+    if not any(k in prompt.lower() for k in ["tripod", "camera", "pan", "zoom"]):
+        prompt = f"{prompt.strip()} Shot on a tripod, natural motion blur, locked camera stability, 4k."
+        
     logger.info(f"Prompt: {prompt}")
     logger.info(f"Seed: {_seed}, Steps: {_steps}")
 
@@ -209,6 +213,7 @@ def generate(
         pipeline = _build_single_stage(models, device)
     load_time = time.time() - t0
 
+    from ltx_core.components.guiders import MultiModalGuiderParams
     video_guider_params = MultiModalGuiderParams(
         cfg_scale=guide["video_cfg_scale"],
         stg_scale=guide["video_stg_scale"],
@@ -217,9 +222,10 @@ def generate(
         skip_step=guide["video_skip_step"],
         stg_blocks=guide["video_stg_blocks"],
     )
-    audio_guider_params = MultiModalGuiderParams(
-        cfg_scale=guide.get("audio_cfg_scale", 7.0),
-        modality_scale=guide.get("audio_modality_scale", 3.0),
+    logger.info(
+        f"Guidance: video(cfg={guide['video_cfg_scale']} stg={guide['video_stg_scale']} "
+        f"rescale={guide['video_rescale_scale']} modality={guide['a2v_guidance_scale']} "
+        f"stg_blocks={guide['video_stg_blocks']}) audio(defaults, frozen)"
     )
 
     # Image conditioning strength: 1.0 freezes frame 0 (no lip movement).
@@ -247,7 +253,6 @@ def generate(
             frame_rate=_fps,
             num_inference_steps=_steps,
             video_guider_params=video_guider_params,
-            audio_guider_params=audio_guider_params,
             images=images,
             audio_path=audio_path,
             audio_start_time=audio_start,
@@ -265,7 +270,6 @@ def generate(
             frame_rate=_fps,
             num_inference_steps=_steps,
             video_guider_params=video_guider_params,
-            audio_guider_params=audio_guider_params,
             images=images,
             audio_path=audio_path,
             audio_start_time=audio_start,
@@ -290,8 +294,33 @@ def generate(
         video_chunks_number=video_chunks,
     )
 
+    total_time = time.time() - t0
     logger.info(f"Done! {output_path}")
-    logger.info(f"Model load: {load_time:.0f}s | Generation: {gen_time:.0f}s | Total: {time.time()-t0:.0f}s")
+    logger.info(f"Model load: {load_time:.0f}s | Generation: {gen_time:.0f}s | Total: {total_time:.0f}s")
+    logger.info(f"Output: {output_path} | {_width}x{_height} @ {_fps}fps | {_num_frames} frames ({_num_frames/_fps:.1f}s) | seed={_seed} | total={total_time:.0f}s")
+    return output_path
+
+
+def upscale_video(input_path: str, scale: int = 2) -> str:
+    """Upscale video using ffmpeg lanczos filter, preserving audio."""
+    import subprocess
+
+    output_path = input_path.replace(".mp4", f"_upscaled_{scale}x.mp4")
+    logger.info(f"Upscaling {scale}x: {input_path} -> {output_path}")
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"scale=iw*{scale}:ih*{scale}:flags=lanczos",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-c:a", "copy",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"ffmpeg upscale failed: {result.stderr}")
+        return input_path
+
+    logger.info(f"Upscaled to {output_path}")
     return output_path
 
 
@@ -313,6 +342,8 @@ def main():
     parser.add_argument("--negative-prompt", type=str, default=None)
     parser.add_argument("--image-strength", type=float, default=None,
                         help="Image conditioning strength (0.0-1.0). Lower=more motion/lip sync, higher=more identity. Default 0.3")
+    parser.add_argument("--upscale", type=int, default=None, choices=[2, 4],
+                        help="Upscale output video by 2x or 4x using ffmpeg lanczos after generation")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -325,7 +356,7 @@ def main():
     )
     output_path = str(Path(output_path).resolve())
 
-    generate(
+    result_path = generate(
         image_path=image_path,
         audio_path=audio_path,
         prompt=args.prompt,
@@ -341,6 +372,9 @@ def main():
         negative_prompt=args.negative_prompt,
         image_strength=args.image_strength,
     )
+
+    if args.upscale:
+        upscale_video(result_path, args.upscale)
 
 
 if __name__ == "__main__":

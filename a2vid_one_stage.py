@@ -59,6 +59,7 @@ class A2VidOneStage:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        self._peak_rss = 0.0
         # Store config for lazy model loading in __call__
         self._checkpoint_path = checkpoint_path
         self._gemma_root = gemma_root
@@ -70,10 +71,9 @@ class A2VidOneStage:
         """Log current memory usage for diagnostics."""
         parts = [f"[Memory] {tag}"]
         try:
-            rss = os.getpid()
             import psutil
-            proc = psutil.Process()
-            rss_gb = proc.memory_info().rss / (1024 ** 3)
+            rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+            self._peak_rss = max(self._peak_rss, rss_gb)
             parts.append(f"RSS={rss_gb:.1f}GB")
         except ImportError:
             pass
@@ -111,7 +111,6 @@ class A2VidOneStage:
         frame_rate: float,
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
-        audio_guider_params: MultiModalGuiderParams,
         images: list,
         audio_path: str,
         audio_start_time: float = 0.0,
@@ -127,6 +126,7 @@ class A2VidOneStage:
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
+        _t_start = time.time()
 
         self._log_memory("pipeline start")
 
@@ -151,7 +151,8 @@ class A2VidOneStage:
 
         del prompt_encoder
         self._flush_memory("prompt encoder freed")
-        logger.info(f"  Prompts encoded + encoder freed ({time.time()-t0:.0f}s)")
+        t_prompts = time.time() - t0
+        logger.info(f"  Prompts encoded + encoder freed ({t_prompts:.0f}s)")
 
         # --- Encode audio, then free audio encoder (~4GB) ---
         logger.info("Loading audio conditioner...")
@@ -175,7 +176,8 @@ class A2VidOneStage:
 
         del audio_conditioner
         self._flush_memory("audio conditioner freed")
-        logger.info(f"  Audio encoded + encoder freed ({time.time()-t0:.0f}s)")
+        t_audio = time.time() - t0
+        logger.info(f"  Audio encoded + encoder freed ({t_audio:.0f}s)")
 
         audio_shape = AudioLatentShape.from_duration(
             batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
@@ -214,7 +216,8 @@ class A2VidOneStage:
 
         del image_conditioner
         self._flush_memory("image conditioner freed")
-        logger.info(f"  Image encoded + encoder freed ({time.time()-t0:.0f}s)")
+        t_image = time.time() - t0
+        logger.info(f"  Image encoded + encoder freed ({t_image:.0f}s)")
 
         # --- Diffusion: load transformer (~44GB), denoise, then free ---
         logger.info("Loading diffusion transformer...")
@@ -232,6 +235,7 @@ class A2VidOneStage:
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
             dtype=torch.float32, device=self.device
         )
+        logger.info(f"  Sigma schedule ({len(sigmas)-1} steps): {sigmas[0].item():.4f} -> {sigmas[-2].item():.4f}")
 
         logger.info(f"Denoising {num_inference_steps} steps at {width}x{height}...")
         video_state, _ = diffusion(
@@ -243,8 +247,7 @@ class A2VidOneStage:
                     negative_context=v_context_n,
                 ),
                 audio_guider=MultiModalGuider(
-                    params=audio_guider_params,
-                    negative_context=a_context_n,
+                    params=MultiModalGuiderParams(),
                 ),
             ),
             sigmas=sigmas,
@@ -270,7 +273,8 @@ class A2VidOneStage:
         del diffusion, sigmas, conditionings
         del v_context_p, v_context_n, a_context_p, encoded_audio_latent
         self._flush_memory("diffusion transformer freed")
-        logger.info(f"  Denoising complete + transformer freed ({time.time()-t0:.0f}s)")
+        t_diffusion = time.time() - t0
+        logger.info(f"  Denoising complete + transformer freed ({t_diffusion:.0f}s)")
 
         # --- Decode video, then free decoder (~4GB) ---
         logger.info("Loading video decoder...")
@@ -286,7 +290,8 @@ class A2VidOneStage:
 
         del video_decoder, video_state
         self._flush_memory("video decoder freed")
-        logger.info(f"  Video decoded + decoder freed ({time.time()-t0:.0f}s)")
+        t_decode = time.time() - t0
+        logger.info(f"  Video decoded + decoder freed ({t_decode:.0f}s)")
 
         # Return original audio for fidelity
         original_audio = Audio(
@@ -295,4 +300,11 @@ class A2VidOneStage:
         )
 
         self._log_memory("pipeline complete")
+        logger.info(
+            f"Run summary: {num_inference_steps} steps @ {width}x{height} "
+            f"| {num_frames} frames | peak RSS={self._peak_rss:.1f}GB "
+            f"| prompts={t_prompts:.0f}s audio={t_audio:.0f}s image={t_image:.0f}s "
+            f"diffusion={t_diffusion:.0f}s decode={t_decode:.0f}s "
+            f"| total={time.time()-_t_start:.0f}s"
+        )
         return decoded_video, original_audio

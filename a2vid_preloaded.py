@@ -58,6 +58,7 @@ class A2VidPreloaded:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        self._peak_rss = 0.0
 
         distilled_lora_spec = LoraPathStrengthAndSDOps(
             distilled_lora_path, distilled_lora_strength, LTXV_LORA_COMFY_RENAMING_MAP
@@ -96,6 +97,7 @@ class A2VidPreloaded:
         try:
             import psutil
             rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
+            self._peak_rss = max(self._peak_rss, rss_gb)
             parts.append(f"RSS={rss_gb:.1f}GB")
         except ImportError:
             pass
@@ -133,7 +135,6 @@ class A2VidPreloaded:
         frame_rate: float,
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
-        audio_guider_params: MultiModalGuiderParams,
         images: list,
         audio_path: str,
         audio_start_time: float = 0.0,
@@ -146,6 +147,7 @@ class A2VidPreloaded:
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
+        _t_start = time.time()
 
         self._log_memory("pipeline start")
 
@@ -160,7 +162,8 @@ class A2VidPreloaded:
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
         self._flush_memory("prompts encoded")
-        logger.info(f"  Prompts encoded ({time.time()-t0:.0f}s)")
+        t_prompts = time.time() - t0
+        logger.info(f"  Prompts encoded ({t_prompts:.0f}s)")
 
         # --- 2. Encode audio ---
         logger.info("Encoding audio...")
@@ -190,7 +193,8 @@ class A2VidPreloaded:
             logger.info(f"  Padded audio latent from {actual_frames} to {target_frames} frames")
 
         self._flush_memory("audio encoded")
-        logger.info(f"  Audio encoded ({time.time()-t0:.0f}s)")
+        t_audio = time.time() - t0
+        logger.info(f"  Audio encoded ({t_audio:.0f}s)")
 
         # --- 3. Stage 1: denoise at half resolution, audio frozen ---
         s1_h, s1_w = height // 2, width // 2
@@ -207,6 +211,7 @@ class A2VidPreloaded:
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
             dtype=torch.float32, device=self.device
         )
+        logger.info(f"  Sigma schedule ({len(sigmas)-1} steps): {sigmas[0].item():.4f} -> {sigmas[-2].item():.4f}")
 
         video_state, _ = self.stage_1(
             denoiser=GuidedDenoiser(
@@ -217,8 +222,7 @@ class A2VidPreloaded:
                     negative_context=v_context_n,
                 ),
                 audio_guider=MultiModalGuider(
-                    params=audio_guider_params,
-                    negative_context=a_context_n,
+                    params=MultiModalGuiderParams(),
                 ),
             ),
             sigmas=sigmas,
@@ -240,7 +244,8 @@ class A2VidPreloaded:
         )
 
         self._flush_memory("stage 1 complete")
-        logger.info(f"  Stage 1 complete ({time.time()-t0:.0f}s)")
+        t_stage1 = time.time() - t0
+        logger.info(f"  Stage 1 complete ({t_stage1:.0f}s)")
 
         # --- 4. Upsample 2x ---
         # MPS can crash on einops rearrange + depthwise conv in upsampler.
@@ -267,13 +272,15 @@ class A2VidPreloaded:
 
         del video_state
         self._flush_memory("upsampled")
-        logger.info(f"  Upsampled ({time.time()-t0:.0f}s)")
+        t_upsample = time.time() - t0
+        logger.info(f"  Upsampled ({t_upsample:.0f}s)")
 
         # --- 5. Stage 2: refine at full resolution, audio frozen ---
         logger.info(f"Stage 2: refining 4 steps at {width}x{height}...")
         t0 = time.time()
 
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        logger.info(f"  Distilled sigmas ({len(distilled_sigmas)-1} steps): {distilled_sigmas[0].item():.4f} -> {distilled_sigmas[-2].item():.4f}")
 
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
@@ -306,7 +313,8 @@ class A2VidPreloaded:
 
         del upscaled_video_latent, distilled_sigmas
         self._flush_memory("stage 2 complete")
-        logger.info(f"  Stage 2 complete ({time.time()-t0:.0f}s)")
+        t_stage2 = time.time() - t0
+        logger.info(f"  Stage 2 complete ({t_stage2:.0f}s)")
 
         # --- 6. Decode video ---
         logger.info("Decoding video...")
@@ -319,7 +327,15 @@ class A2VidPreloaded:
             sampling_rate=decoded_audio.sampling_rate,
         )
 
+        t_decode = time.time() - t0
         self._log_memory("pipeline complete")
-        logger.info(f"  Video decoded ({time.time()-t0:.0f}s)")
+        logger.info(f"  Video decoded ({t_decode:.0f}s)")
+        logger.info(
+            f"Run summary: {num_inference_steps} steps @ {s1_w}x{s1_h} (stage1) + 4 steps @ {width}x{height} (stage2) "
+            f"| {num_frames} frames | peak RSS={self._peak_rss:.1f}GB "
+            f"| prompts={t_prompts:.0f}s audio={t_audio:.0f}s stage1={t_stage1:.0f}s "
+            f"upsample={t_upsample:.0f}s stage2={t_stage2:.0f}s decode={t_decode:.0f}s "
+            f"| total={time.time()-_t_start:.0f}s"
+        )
 
         return decoded_video, original_audio

@@ -41,7 +41,7 @@ The audio VAE requires **stereo input**. Mono files are auto-converted by `ensur
 generate.py            # CLI entry point — parses args, loads config, runs pipeline
 a2vid_preloaded.py     # Two-stage pipeline (staged transformer loading, memory-efficient)
 a2vid_one_stage.py     # Single-stage pipeline (MPS-compatible fallback)
-config.yaml            # Quality config (20 steps, STG on, ~25 min)
+config.yaml            # Quality config (30 steps, upstream defaults, ~35 min)
 config.fast.yaml       # Fast config (10 steps, STG off, ~5 min)
 setup.sh               # Automated setup: clone LTX-2, create venv, install deps
 .gitignore             # Ignores .venv/, LTX-2/, models/, outputs/
@@ -110,7 +110,7 @@ All dimensions are snapped to multiples of 32. Default behavior matches input im
 ### Lip Sync (image_conditioning_strength)
 - `image_conditioning_strength` controls how much the first frame locks to the input image.
 - `1.0` = frame 0 completely frozen (denoise_mask=0.0) — **no lip sync possible**.
-- `0.3` (default) = model has 70% freedom to animate the face — enables lip sync.
+- `0.7` (default) = preserves identity while allowing lip sync (per ComfyUI workflows).
 - `0.0` = no image conditioning — model generates freely (identity may drift).
 - Tune via config or `--image-strength` CLI flag.
 - Known LTX-2.3 limitation: A2V is better at energy/pacing than precise lip sync (community-wide).
@@ -119,12 +119,21 @@ All dimensions are snapped to multiples of 32. Default behavior matches input im
 ## Config
 
 Two configs shipped:
-- `config.yaml` — Quality mode: 20 steps, STG on (`stg_scale=1.0`, `stg_blocks=[28]`), ~25 min (two-stage)
-- `config.fast.yaml` — Fast mode: 10 steps, STG off (`stg_scale=0.0`, `stg_blocks=[]`), ~10 min (two-stage)
+- `config.yaml` — Quality mode: 30 steps, upstream LTX-2.3 defaults, ~35 min (two-stage)
+- `config.fast.yaml` — Fast mode: 10 steps, STG off (`stg_scale=0.0`), ~10 min (two-stage)
+
+### Guidance Parameters (aligned with upstream `LTX_2_3_PARAMS`)
+
+Both pipelines use `GuidedDenoiser` with constant guidance params throughout all denoising steps. Values are aligned with the official upstream defaults in `ltx-pipelines/utils/constants.py`:
+
+- Video: cfg=3.0, stg=1.0, rescale=0.7, modality=3.0, stg_blocks=[28]
+- Audio: cfg=7.0, modality=3.0
+
+**Do NOT reduce audio_cfg below 7.0** — this is the primary lip sync driver. **stg_blocks must be [28] for LTX-2.3** (block 29 is the LTX-2.0 default).
 
 ### Speed Notes
-- STG ON = 3 forward passes/step (cond + uncond + perturbed). STG OFF = 2 passes. ~33% speedup per step.
-- Two-stage is ~2.6x faster than single-stage: 20 steps at half-res + 4 steps at full-res vs 20 steps at full-res.
+- STG ON = 3-4 forward passes/step (cond + uncond + perturbed + modality). STG OFF = 2-3 passes.
+- Two-stage is ~2.6x faster than single-stage: 30 steps at half-res + 4 steps at full-res vs 30 steps at full-res.
 - Stage 2 always uses SimpleDenoiser (1 pass/step, no STG/CFG) regardless of config.
 
 ## Development Notes
