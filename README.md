@@ -29,7 +29,7 @@ Generate lip-synced talking-head videos from a still image and an audio file. Bu
 
 > **Prompt:** *"A weathered pirate captain speaking boldly, his lips moving with each word, beard shifting as his jaw opens and closes, fierce eyes narrowing, face lit by warm flickering firelight"*
 >
-> Generated with `--seed 77 --upscale 2` (~5 min per chunk on M4 Max 128GB)
+> Generated with `--seed 77 --upscale 2` (~5 min per chunk on M5 Max 128GB)
 
 ## Features
 
