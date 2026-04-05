@@ -10,20 +10,22 @@ Generate lip-synced talking-head videos from a still image and an audio file. Bu
 
 <table>
 <tr>
-<td align="center" width="40%"><strong>Input Image</strong></td>
-<td align="center" width="60%"><strong>Output Video</strong></td>
+<td align="center" width="50%"><strong>Input Image</strong></td>
+<td align="center" width="50%"><strong>Output Video</strong></td>
 </tr>
 <tr>
-<td><img src="demo/pirate_input.png" width="300"></td>
+<td><img src="demo/pirate_input.png"></td>
 <td>
 
-<video src="https://github.com/user-attachments/assets/4e7fdc2c-d5be-4eb4-b9fe-e1595948a9ff" width="100%"> </video>
+<video src="https://github.com/user-attachments/assets/4e7fdc2c-d5be-4eb4-b9fe-e1595948a9ff"> </video>
 
 </td>
 </tr>
 </table>
 
-🎵 **Audio input:** [pirate_voice.wav](https://github.com/user-attachments/files/26488822/pirate_voice.stereo.wav)
+🎵 **Audio input:**
+
+[pirate_voice.mp3](https://github.com/user-attachments/files/26488944/pirate_voice.mp3)
 
 > **Prompt:** *"A weathered pirate captain speaking boldly, his lips moving with each word, beard shifting as his jaw opens and closes, fierce eyes narrowing, face lit by warm flickering firelight"*
 >
