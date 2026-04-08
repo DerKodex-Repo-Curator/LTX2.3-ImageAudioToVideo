@@ -12,42 +12,73 @@ Known limitations and planned fixes for the LTX-2.3 Image+Audio to Video pipelin
 
 With `video_stg_scale > 0`, the output becomes washed out with no lip sync or meaningful motion. On CUDA, STG=1.0 with `stg_blocks=[28]` works correctly and improves temporal coherence. On MPS, it destroys the output entirely.
 
-### Root Cause (Theory)
+### Root Cause (Researched)
 
-STG computes a perturbation delta: `stg_scale * (conditioned_output - perturbed_output)`, where the perturbed pass skips self-attention in the specified transformer block. These two tensors are large and nearly equal — their difference is the meaningful signal.
+Three confirmed MPS precision issues compound to corrupt STG output:
 
-In **bfloat16** (8-bit mantissa), subtracting two nearly-equal values causes **catastrophic cancellation**: the significant digits cancel and the result is dominated by rounding noise. On CUDA, the rounding behavior is well-tested and the difference stays meaningful. On MPS, Apple's GPU appears to produce slightly different rounding, making the subtraction capture noise instead of signal. This noise, multiplied by `stg_scale` and applied at every denoising step, compounds into corrupted output.
+**1. MPS "fast math" ([pytorch/pytorch#84936](https://github.com/pytorch/pytorch/issues/84936)):**
+Apple's MPSGraph compiles ALL Metal kernels with fast math enabled. Operations like `exp()`, `softmax()`, and attention produce ~1e-7 different results per operation vs CUDA. There is NO PyTorch setting to disable this. Apple acknowledged but never fixed it.
 
-### Proposed Fix
+**2. bfloat16 attention masking errors ([pytorch/pytorch#163588](https://github.com/pytorch/pytorch/issues/163588)):**
+Flex Attention with bfloat16 produces up to 3.4% relative error when masking positions. STG masks self-attention in block 28 for the perturbation pass — directly affected.
 
-**Cast the STG subtraction to float32** in `_guided_denoise()` at `LTX-2/packages/ltx-pipelines/src/ltx_pipelines/utils/denoisers.py`.
+**3. Error amplification chain:**
+The `cond` and `ptb` passes take different paths through block 28 (real attention vs V-only bypass). Over 30 transformer blocks of cross-attention + feedforward, MPS fast-math errors (~1e-7 per op) accumulate differently in each pass. The subtraction `cond - ptb` then REVEALS these accumulated errors instead of capturing the intended STG signal. The rescaling (`cond.std() / pred.std()` in bfloat16) further amplifies the noise.
 
-The fix would be in the `MultiModalGuider.calculate()` method at `LTX-2/packages/ltx-core/src/ltx_core/components/guiders.py`, approximately where the guidance formula is computed:
+**Key precision loss points** (from code trace):
+- `guiders.py:259` — STG delta: `stg_scale * (cond - ptb)` in bfloat16
+- `guiders.py:264-265` — Rescale: `cond.std() / pred.std()` in bfloat16
+- `attention.py:234-235` — Perturbation mask blend: `out * mask + v * (1-mask)` in bfloat16
+- `batch_split.py:75-85` — If cond and ptb land in different chunks, MPS non-determinism adds further divergence
+
+### Fix Strategy: Approach A then Approach C
+
+#### Approach A: Float32 guidance calculation (try first — zero overhead)
+
+Cast the entire guidance formula and rescaling to float32 in `MultiModalGuider.calculate()` at `ltx-core/components/guiders.py`:
 
 ```python
-# Current (bfloat16 — catastrophic cancellation on MPS):
-stg_delta = self.params.stg_scale * (cond - perturbed)
-
-# Proposed fix (float32 subtraction):
-stg_delta = self.params.stg_scale * (cond.float() - perturbed.float()).to(cond.dtype)
+def calculate(self, cond, uncond_text, uncond_perturbed, uncond_modality):
+    # Upcast to float32 for precision-sensitive guidance math
+    dtype = cond.dtype
+    cond, uncond_text, uncond_perturbed, uncond_modality = (
+        t.float() if isinstance(t, torch.Tensor) else t
+        for t in (cond, uncond_text, uncond_perturbed, uncond_modality)
+    )
+    pred = (
+        cond
+        + (self.params.cfg_scale - 1) * (cond - uncond_text)
+        + self.params.stg_scale * (cond - uncond_perturbed)
+        + (self.params.modality_scale - 1) * (cond - uncond_modality)
+    )
+    if self.params.rescale_scale != 0:
+        factor = cond.std() / pred.std()
+        factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
+        pred = pred * factor
+    return pred.to(dtype)
 ```
+
+**Likelihood of success:** ~30%. Fixes the subtraction and rescaling precision but not the accumulated MPS fast-math errors inside the transformer.
+
+#### Approach C: Separate float32 forward pass for perturbation (escalation — heavy but reliable)
+
+If Approach A fails, run the STG perturbation as a completely separate transformer forward pass in float32:
+
+1. In `_guided_denoise()` at `ltx-pipelines/utils/denoisers.py`, split the perturbation pass out of the batch
+2. Run cond+uncond+mod as one batched bfloat16 pass (normal)
+3. Run ptb alone as a separate float32 forward pass
+4. Cast cond to float32, compute `cond - ptb` in float32, cast back
+
+This eliminates ALL MPS fast-math errors for the ptb pass. Cost: one extra full transformer forward pass in float32 (~30-50% slower per step).
+
+**Likelihood of success:** ~90%.
 
 ### How to Test
 
-1. Apply the float32 cast patch to the upstream code
+1. Apply the fix to the LTX-2 submodule
 2. Set `video_stg_scale: 1.0` and `video_stg_blocks: [28]` in `config.yaml`
-3. Generate a video and verify:
-   - Output is not washed out
-   - Lip sync is present
-   - Temporal coherence is improved compared to STG=0
-4. If it works, submit the fix as a PR to Lightricks/LTX-2 with MPS test results
-
-### Fallback
-
-If float32 cast doesn't fix it, try:
-- Lower `stg_scale` values (0.1, 0.2, 0.3) to reduce noise amplification
-- Different `stg_blocks` values (try [27], [29])
-- Run the entire perturbation pass in float32 (heavier but more reliable)
+3. Generate with the working pirate portrait + short audio (< 6s)
+4. Verify output is not washed out, has lip sync, and shows improved temporal coherence vs STG=0
 
 ---
 
